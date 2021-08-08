@@ -36,6 +36,11 @@
 #include "asterisk/dsp.h"
 #include <math.h>
 
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 /*** DOCUMENTATION
 	<function name="COIN_DETECT" language="en_US">
 		<synopsis>
@@ -44,9 +49,90 @@
 	</function>
  ***/
 
+typedef struct {
+	/*! The previous previous sample calculation (No binary point just plain int) */
+	int v2;
+	/*! The previous sample calculation (No binary point just plain int) */
+	int v3;
+	/*! v2 and v3 power of two exponent to keep value in int range */
+	int chunky;
+	/*! 15 bit fixed point goertzel coefficient = 2 * cos(2 * pi * freq / sample_rate) */
+	int fac;
+} goertzel_state_t;
+
+typedef struct {
+	int value;
+	int power;
+} goertzel_result_t;
+
+#define COINDET_G_RATE 60
+#define COINDET_THRESH 1e8
+
+struct detector_state {
+    int cd_current_sample;
+    goertzel_state_t tone_a;
+    goertzel_state_t tone_b;
+};
+
 struct coindetect_data {
     struct ast_audiohook audiohook;
+    struct detector_state rx;
+    struct detector_state tx; 
 };
+
+static void coindetect_process(struct ast_frame * f, struct detector_state * s);
+
+
+static inline void goertzel_sample(goertzel_state_t *s, short sample)
+{
+	int v1;
+
+	/*
+	 * Shift previous values so
+	 * v1 is previous previous value
+	 * v2 is previous value
+	 * until the new v3 is calculated.
+	 */
+	v1 = s->v2;
+	s->v2 = s->v3;
+
+	/* Discard the binary fraction introduced by s->fac */
+	s->v3 = (s->fac * s->v2) >> 15;
+	/* Scale sample to match previous values */
+	s->v3 = s->v3 - v1 + (sample >> s->chunky);
+
+	if (abs(s->v3) > (1 << 15)) {
+		/* The result is now too large so increase the chunky power. */
+		s->chunky++;
+		s->v3 = s->v3 >> 1;
+		s->v2 = s->v2 >> 1;
+	}
+}
+
+static inline float goertzel_result(goertzel_state_t *s)
+{
+	goertzel_result_t r;
+
+	r.value = (s->v3 * s->v3) + (s->v2 * s->v2);
+	r.value -= ((s->v2 * s->v3) >> 15) * s->fac;
+	/*
+	 * We have to double the exponent because we multiplied the
+	 * previous sample calculation values together.
+	 */
+	r.power = s->chunky * 2;
+	return (float)r.value * (float)(1 << r.power);
+}
+
+static inline void goertzel_init(goertzel_state_t *s, float freq, unsigned int sample_rate)
+{
+	s->v2 = s->v3 = s->chunky = 0;
+	s->fac = (int)(32768.0 * 2.0 * cos(2.0 * M_PI * freq / sample_rate));
+}
+
+static inline void goertzel_reset(goertzel_state_t *s)
+{
+	s->v2 = s->v3 = s->chunky = 0;
+}
 
 static void destroy_callback(void *data)
 {
@@ -60,6 +146,32 @@ static const struct ast_datastore_info coindetect_datastore = {
     .type = "coindetect",
     .destroy = destroy_callback,
 };
+
+static int coindetect_cb(struct ast_audiohook *audiohook, struct ast_channel *chan, struct ast_frame *f, enum ast_audiohook_direction direction)
+{
+	struct ast_datastore *datastore = NULL;
+	struct coindetect_data *coindetect = NULL;
+
+
+	if (!f) {
+		return 0;
+	}
+	if (audiohook->status == AST_AUDIOHOOK_STATUS_DONE) {
+		return -1;
+	}
+
+	if (!(datastore = ast_channel_datastore_find(chan, &coindetect_datastore, NULL))) {
+		return -1;
+	}
+
+	coindetect = datastore->data;
+    if (direction == AST_AUDIOHOOK_DIRECTION_WRITE) {
+        coindetect_process(f, &coindetect->tx);
+    } else {
+        coindetect_process(f, &coindetect->rx);
+    }
+	return 0;
+}
 
 static int coindetect_helper(struct ast_channel *chan, const char *cmd, char *data, const char *value)
 {
@@ -84,9 +196,15 @@ static int coindetect_helper(struct ast_channel *chan, const char *cmd, char *da
 			ast_datastore_free(datastore);
 			return 0;
 		}
+        coindetect->rx.cd_current_sample = 0;
+        coindetect->tx.cd_current_sample = 0;
+        goertzel_init(&(coindetect->rx.tone_a), 1700, 8000);
+        goertzel_init(&(coindetect->rx.tone_b), 2200, 8000);
+        goertzel_init(&(coindetect->tx.tone_a), 1700, 8000);
+        goertzel_init(&(coindetect->tx.tone_b), 2200, 8000);
 
-		ast_audiohook_init(&coindetect->audiohook, AST_AUDIOHOOK_TYPE_MANIPULATE, "coin_detect", AST_AUDIOHOOK_MANIPULATE_ALL_RATES);
-		//shift->audiohook.manipulate_callback = pitchshift_cb;
+		ast_audiohook_init(&coindetect->audiohook, AST_AUDIOHOOK_TYPE_MANIPULATE, "coin_detect", 0);
+		coindetect->audiohook.manipulate_callback = coindetect_cb;
 		datastore->data = coindetect;
 		new = 1;
 	} else {
@@ -96,41 +214,11 @@ static int coindetect_helper(struct ast_channel *chan, const char *cmd, char *da
 
     ast_log(LOG_NOTICE, "I can't really detect coins yet");
 
-
-	// if (!strcasecmp(value, "highest")) {
-	// 	amount = HIGHEST;
-	// } else if (!strcasecmp(value, "higher")) {
-	// 	amount = HIGHER;
-	// } else if (!strcasecmp(value, "high")) {
-	// 	amount = HIGH;
-	// } else if (!strcasecmp(value, "lowest")) {
-	// 	amount = LOWEST;
-	// } else if (!strcasecmp(value, "lower")) {
-	// 	amount = LOWER;
-	// } else if (!strcasecmp(value, "low")) {
-	// 	amount = LOW;
-	// } else {
-	// 	if (!sscanf(value, "%30f", &amount) || (amount <= 0) || (amount > 4)) {
-	// 		goto cleanup_error;
-	// 	}
-	// }
-
-	// if (!strcasecmp(data, "rx")) {
-	// 	shift->rx.shift_amount = amount;
-	// } else if (!strcasecmp(data, "tx")) {
-	// 	shift->tx.shift_amount = amount;
-	// } else if (!strcasecmp(data, "both")) {
-	// 	shift->rx.shift_amount = amount;
-	// 	shift->tx.shift_amount = amount;
-	// } else {
-	// 	goto cleanup_error;
-	// }
-
 	if (new) {
 		ast_channel_lock(chan);
 		ast_channel_datastore_add(chan, datastore);
 		ast_channel_unlock(chan);
-		// ast_audiohook_attach(chan, &coindetect->audiohook);
+		ast_audiohook_attach(chan, &coindetect->audiohook);
 	}
 
 	return 0;
@@ -142,6 +230,29 @@ cleanup_error:
 		ast_datastore_free(datastore);
 	}
 	return -1;
+}
+
+static void coindetect_process(struct ast_frame * f, struct detector_state * s) {
+	int16_t *data = (int16_t *) f->data.ptr;
+    int samples = f->samples;
+    for(int n = 0; n < samples; n++) {
+        int16_t samp = data[n];
+        goertzel_sample(&(s->tone_a), samp);
+        goertzel_sample(&(s->tone_b), samp);
+        s->cd_current_sample++;
+        if(s->cd_current_sample < COINDET_G_RATE) {
+            continue;
+        }
+        float e1 = goertzel_result(&(s->tone_a));
+        float e2 = goertzel_result(&(s->tone_a));
+        if (e1 > COINDET_THRESH && e2 > COINDET_THRESH) {
+            ast_log(LOG_NOTICE,"e1: %f, e2: %f", e1, e2);
+        }
+        // ast_log(LOG_NOTICE,"e1: %f, e2: %f", e1, e2);
+
+        goertzel_reset(&(s->tone_a));
+        goertzel_reset(&(s->tone_b));
+    }
 }
 
 static struct ast_custom_function coin_detect_function = {
