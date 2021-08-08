@@ -243,15 +243,16 @@ static void coindetect_process(struct ast_frame * f, struct detector_state * s) 
         if(s->cd_current_sample < COINDET_G_RATE) {
             continue;
         }
-        float e1 = goertzel_result(&(s->tone_a));
-        float e2 = goertzel_result(&(s->tone_a));
-        if (e1 > COINDET_THRESH && e2 > COINDET_THRESH) {
-            ast_log(LOG_NOTICE,"e1: %f, e2: %f", e1, e2);
+        float e1 = goertzel_result(&(s->tone_a))/32786;
+        float e2 = goertzel_result(&(s->tone_a))/32786;
+        if (e1 * e2 > COINDET_THRESH) {
+            ast_log(LOG_NOTICE,"e1: %f, e2: %f, c: %f", e1, e2, e1*e2);
+            data[n] = 0;
         }
         // ast_log(LOG_NOTICE,"e1: %f, e2: %f", e1, e2);
 
-        goertzel_reset(&(s->tone_a));
-        goertzel_reset(&(s->tone_b));
+        // goertzel_reset(&(s->tone_a));
+        // goertzel_reset(&(s->tone_b));
     }
 }
 
